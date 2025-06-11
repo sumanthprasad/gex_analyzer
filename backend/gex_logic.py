@@ -82,24 +82,30 @@ def build_call_put_dataframe(df_left, df_right, strike_series, call_idx, put_idx
 
     out_df = pd.DataFrame(rows_out)
     for col in ["Strike Price", "OI", "Delta", "Gamma", "Theta"]:
-        out_df[col] = (
-            out_df[col].astype(str)
-                        .str.replace(',', '', regex=True)
-                        .str.strip()
-        )
         out_df[col] = pd.to_numeric(out_df[col], errors="coerce").fillna(0)
 
     out_df.sort_values("Strike Price", inplace=True)
     out_df.reset_index(drop=True, inplace=True)
     return out_df
 
-def filter_strikes_around_spot(df, spot_price, n=12):
-    below = df[df["Strike Price"] < spot_price].tail(n)
-    above = df[df["Strike Price"] > spot_price].head(n)
-    selected = pd.concat([below, above])
-    if selected.empty:
+def filter_strikes_around_spot(df, spot_price, n=15, step=50):
+    """
+    Only include strikes from spot - n*step up to spot + n*step (inclusive),
+    stepping by the contract step.
+    """
+    # Build the exact valid strikes
+    valid_strikes = set(range(
+        int(spot_price - n * step),
+        int(spot_price + (n + 1) * step),
+        step
+    ))
+    # Filter and sort
+    filtered = df[df["Strike Price"].isin(valid_strikes)]
+    if filtered.empty:
         raise ValueError("No strikes found around the specified spot.")
-    return selected
+    return filtered.sort_values("Strike Price").reset_index(drop=True)
+
+
 
 def compute_metrics(df, spot_price, contract_size=75, vol=0.2, T=0.25):
     df["d1"] = np.log(spot_price / df["Strike Price"]) + 0.5 * vol ** 2 * T
@@ -150,28 +156,29 @@ def summarize(calls_df, puts_df):
         }
     return agg(calls_df), agg(puts_df)
 
-def process_all(df, spot, strikes, contract_size, vol, expiry, column_mode):
-    df.columns = df.columns.str.strip()
-    df = df.replace({',': ''}, regex=True)
-    auto_rename_put_columns(df)
+def compress(df, col):
+    return df.groupby("Strike Price")[col].sum().reset_index()
 
-    if column_mode == "keyword":
-        df_left, df_right, strike_series, call_idx, put_idx = detect_columns_keyword_based(df)
-        df_cp = build_call_put_dataframe(df_left, df_right, strike_series, call_idx, put_idx)
-    else:
-        raise NotImplementedError("Only 'keyword' column detection supported.")
+def format_output_series(df_calc, merged, calls_df, puts_df, zero_gamma_level, spot):
+    def safe_float(x): return float(x) if pd.notna(x) else 0.0
+    def safe_int(x): return int(float(x)) if pd.notna(x) else 0
 
-    df_sel = filter_strikes_around_spot(df_cp, spot, n=strikes)
-    df_calc = compute_metrics(df_sel, spot, contract_size, vol, expiry)
-    calls_df, puts_df = separate_calls_puts(df_calc)
-    merged, zero_gamma_level = calculate_zero_gamma_level(calls_df, puts_df)
-    c_sum, p_sum = summarize(calls_df, puts_df)
-    total_net_gamma = merged["Net GEX 1pct"].sum()
+    def make_series(df, col):
+        return [
+            {"strike": safe_int(r["Strike Price"]), "value": safe_float(r[col])}
+            for _, r in compress(df, col).iterrows()
+        ]
 
-    avg_vtr_calls = calls_df["VegaTheta_Ratio"].mean()
-    avg_vtr_puts = puts_df["VegaTheta_Ratio"].mean()
+    net_gex_1pct = [
+        {"strike": safe_int(r["Strike Price"]), "value": safe_float(r["Net GEX 1pct"])}
+        for _, r in merged.iterrows()
+    ]
+    total_net_gamma = sum([d["value"] for d in net_gex_1pct])
+    avg_vtr_calls = calls_df["VegaTheta_Ratio"].mean() or 0.0
+    avg_vtr_puts = puts_df["VegaTheta_Ratio"].mean() or 0.0
     diff = avg_vtr_calls - avg_vtr_puts
     tol, high = 0.15, 0.3
+
     sentiment = (
         "Sideways" if abs(diff) < tol else
         "Bullish" if diff >= high else
@@ -180,20 +187,34 @@ def process_all(df, spot, strikes, contract_size, vol, expiry, column_mode):
         "Mildly Bearish" if diff <= -tol else "Neutral"
     )
 
-    return {
-        "net_gex_1pct": merged[["Strike Price", "Net GEX 1pct"]].rename(columns={"Strike Price": "strike", "Net GEX 1pct": "value"}).to_dict(orient="records"),
-        "dealer_delta": df_calc[["Strike Price", "Dealer Delta Exposure"]].rename(columns={"Dealer Delta Exposure": "value"}).to_dict(orient="records"),
-        "dealer_vanna": df_calc[["Strike Price", "Dealer Vanna Exposure"]].rename(columns={"Dealer Vanna Exposure": "value"}).to_dict(orient="records"),
-        "gex": df_calc[["Strike Price", "GEX"]].rename(columns={"GEX": "value"}).to_dict(orient="records"),
-        "cumulative_gex": df_calc[["Strike Price", "Cumulative GEX"]].rename(columns={"Cumulative GEX": "value"}).to_dict(orient="records"),
-        "vega_theta_ratio": df_calc[["Strike Price", "VegaTheta_Ratio"]].rename(columns={"VegaTheta_Ratio": "value"}).to_dict(orient="records"),
-        "summary_text": (
-            f"Calls GEX: {c_sum['GEX']:.2e}\n"
-            f"Puts GEX: {p_sum['GEX']:.2e}\n"
-            f"Zero Gamma Level: {f'{zero_gamma_level:.2f}' if zero_gamma_level is not None else 'N/A'}\n"
-            f"Net GEX (scaled 1e11): {total_net_gamma / 1e11:.2f}\n"
-            f"Sentiment: {sentiment}"
-        ),
+    summary = (
+        f"Calls GEX: {calls_df['GEX'].sum():.2e}\n"
+        f"Puts GEX: {puts_df['GEX'].sum():.2e}\n"
+        f"Zero Gamma Level: {zero_gamma_level:.2f}\n"
+        f"Net GEX (scaled 1e11): {total_net_gamma / 1e11:.2f}\n"
+        f"Sentiment: {sentiment}"
+    )
 
-        "sentiment": sentiment
+    gamma_exposures = (
+        df_calc
+        .assign(gammaExposure=lambda d: d["Gamma"] * d["OI"])
+        .groupby("Strike Price")["gammaExposure"]
+        .sum()
+        .reset_index()
+    )
+    # pick strike with max |exposure|
+    gamma_wall_strike = int(
+        gamma_exposures.iloc[gamma_exposures["gammaExposure"].abs().idxmax()]["Strike Price"]
+    )
+    return {
+        "net_gex_1pct": net_gex_1pct,
+        "dealer_delta": make_series(df_calc, "Dealer Delta Exposure"),
+        "dealer_vanna": make_series(df_calc, "Dealer Vanna Exposure"),
+        "gex": make_series(df_calc, "GEX"),
+        "cumulative_gex": make_series(df_calc, "Cumulative GEX"),
+        "vega_theta_ratio": make_series(df_calc, "VegaTheta_Ratio"),
+        "summary_text": summary,
+        "sentiment": sentiment,
+        "spot": spot,
+        "gamma_wall_strike": gamma_wall_strike,
     }

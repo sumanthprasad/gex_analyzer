@@ -168,6 +168,12 @@ def format_output_series(df_calc, merged, calls_df, puts_df, zero_gamma_level, s
             {"strike": safe_int(r["Strike Price"]), "value": safe_float(r[col])}
             for _, r in compress(df, col).iterrows()
         ]
+    # ── Separate Dealer Vanna for Calls vs Puts ─────────────────────
+    def make_series_df(df, col):
+        return [
+            {"strike": int(r["Strike Price"]), "value": float(r[col])}
+            for _, r in df.groupby("Strike Price")[col].sum().reset_index().iterrows()
+        ]
 
     net_gex_1pct = [
         {"strike": safe_int(r["Strike Price"]), "value": safe_float(r["Net GEX 1pct"])}
@@ -209,7 +215,9 @@ def format_output_series(df_calc, merged, calls_df, puts_df, zero_gamma_level, s
     return {
         "net_gex_1pct": net_gex_1pct,
         "dealer_delta": make_series(df_calc, "Dealer Delta Exposure"),
-        "dealer_vanna": make_series(df_calc, "Dealer Vanna Exposure"),
+        # "dealer_vanna": make_series(df_calc, "Dealer Vanna Exposure"),
+        "dealer_vanna_calls": make_series_df(calls_df, "Dealer Vanna Exposure"),
+        "dealer_vanna_puts":  make_series_df(puts_df,  "Dealer Vanna Exposure"),
         "gex": make_series(df_calc, "GEX"),
         "cumulative_gex": make_series(df_calc, "Cumulative GEX"),
         "vega_theta_ratio": make_series(df_calc, "VegaTheta_Ratio"),

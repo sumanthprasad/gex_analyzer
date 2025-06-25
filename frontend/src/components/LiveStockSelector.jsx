@@ -4,8 +4,9 @@ import axios from "axios";
 function LiveStockSelector({ onRawTicks }) {
   const [symbol, setSymbol] = useState("NIFTY");
   const [isStreaming, setIsStreaming] = useState(false);
-  const [manualExpiry, setManualExpiry] = useState("12JUN2025");
+  const [manualExpiry, setManualExpiry] = useState("26JUN2025");
   const [expiryOptions, setExpiryOptions] = useState([]);
+  const [statusMsg, setStatusMsg] = useState("");
 
   const contractMap = {
     NIFTY: { contractSize: 75, step: 50 },
@@ -39,6 +40,8 @@ function LiveStockSelector({ onRawTicks }) {
         contract_step: step,
       });
       setIsStreaming(true);
+      setStatusMsg("✅ Live stream started! Please wait for charts to load...");
+      setTimeout(() => setStatusMsg(""), 8000);  // optional auto-dismiss
     } catch (err) {
       console.error("Error starting stream:", err);
     }
@@ -112,6 +115,12 @@ function LiveStockSelector({ onRawTicks }) {
           }}
         />
       )}
+      {statusMsg && (
+        <div style={{ marginTop: "10px", color: "#007bff", fontWeight: "bold" }}>
+          {statusMsg}
+        </div>
+      )}
+
 
       <button
         onClick={startStream}

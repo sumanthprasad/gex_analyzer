@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, Form, Request, HTTPException, Query
+from fastapi import FastAPI, UploadFile, Form, Request, HTTPException, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -8,7 +8,8 @@ from typing import List, Dict, Any
 from datetime import datetime
 import __main__ as main
 import shared_state
-
+import asyncio
+from datetime import datetime, timedelta
 
 from gex_logic import (
     filter_strikes_around_spot,
@@ -34,9 +35,66 @@ live_expiry_str: str = ""
 live_strike_range: int = 5
 live_center_spot: int = 0
 
+@app.on_event("startup")
+async def schedule_trending_gex_sampler():
+    async def sampler():
+        # wait until the next 5-min “ceil”
+        now = datetime.now()
+        # compute next minute-multiple of 5
+        next_min = (now.minute // 5 + 1) * 5
+        if next_min >= 60:
+            next_run = now.replace(hour=now.hour + 1, minute=0, second=0, microsecond=0)
+        else:
+            next_run = now.replace(minute=next_min, second=0, microsecond=0)
+        await asyncio.sleep((next_run - now).total_seconds())
+
+        # then loop every 5 minutes
+        while True:
+            # compute net GEX exactly as in /live_data
+            raw_list = globaldata_ws.live_ticks_cache.copy()
+            df_live = parse_option_data(raw_list)
+            if not df_live.empty:
+                # reuse same logic as your GET /live_data
+                center_spot = shared_state.live_center_spot
+                df_sel = filter_strikes_around_spot(
+                    df_live.pipe(lambda d: pd.DataFrame([ 
+                      {"Strike Price": r["Strike Price"], "OptionType": t, **{
+                          "OI": r[f"{'Call' if t=='C' else 'Put'} OI"],
+                          "Delta": r[f"{'Call' if t=='C' else 'Put'} Delta"],
+                          "Gamma": r[f"{'Call' if t=='C' else 'Put'} Gamma"],
+                          "Theta": r[f"{'Call' if t=='C' else 'Put'} Theta"],
+                          "Vega": r.get("Vega", 0)
+                      }} for _, r in d.iterrows() for t in ("C","P")
+                    ])),
+                    center_spot,
+                    n=shared_state.live_strike_range,
+                    step=shared_state.live_contract_step
+                )
+                df_metrics = compute_metrics(df_sel, center_spot, 75, 0.15, 1e-6)
+                calls_df, puts_df = separate_calls_puts(df_metrics)
+                merged, _ = calculate_zero_gamma_level(calls_df, puts_df)
+
+                #current_net_gex = merged["Net GEX"].sum()
+                # … after calculate_zero_gamma_level …
+                # use the 1%‐scaled GEX exactly as in /live_data
+                current_net_gex_1pct = merged["Net GEX 1pct"].sum()
+                scaled_total = current_net_gex_1pct / 1e11
+                print(float(current_net_gex_1pct))
+                ts = datetime.now().strftime("%H:%M")
+                shared_state.trending_history.append({
+                    "time": ts,
+                    "netGex": scaled_total
+                })
+
+            # wait exactly 5 minutes
+            await asyncio.sleep(5 * 60)
+
+    # launch the sampler task
+    asyncio.create_task(sampler())
+
 @app.get("/gfdl/expiry_list")
 async def get_expiry_list():
-    return ["12JUN2025", "19JUN2025", "26JUN2025"]
+    return ["26JUN2025"]
 
 @app.get("/raw_ticks")
 async def get_raw_ticks():
@@ -241,3 +299,21 @@ async def get_live_option_data():
 @app.get("/")
 async def root():
     return {"message": "GEX Analyzer backend is up and running."}
+
+@app.get("/trending_gex")
+async def get_trending_gex():
+    rows = list(shared_state.trending_history)
+    out = []
+    for i, rec in enumerate(rows):
+        prev = rows[i-1]["netGex"] if i > 0 else rec["netGex"]
+        curr = rec["netGex"]
+        delta = curr - prev
+        direction = delta > 0 and "↑" or (delta < 0 and "↓" or "→")
+        out.append({
+            "time": rec["time"],
+            "netGex": rec["netGex"],
+            "newNetGex": curr,
+            "deltaGex": delta,
+            "direction": direction
+        })
+    return out

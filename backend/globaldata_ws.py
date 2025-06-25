@@ -8,7 +8,7 @@ import shared_state
 # 1) Replace these placeholders with your real GFDL WebSocket endpoint & API key:
 # ------------------------------------------------------------------------------------
 GFDL_WS_ENDPOINT = "wss://test.lisuns.com:4576/"
-GFDL_ACCESS_KEY   = "cacedda4-cc86-4858-982a-397ba5866dd9"
+GFDL_ACCESS_KEY   = "770de4e9-955c-42a0-820a-b3097535112c"
 
 # ------------------------------------------------------------------------------------
 # 2) This list will store all live Option‐Greek ticks. FastAPI’s /live_data will serve this.
